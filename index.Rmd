@@ -1,0 +1,293 @@
+---
+title: "Analyzing and predicting internet provider data"
+author: "Damian Wisniewski"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include = FALSE, ECHO = FALSE}
+# Clean enviroment
+rm(list=ls())
+
+# Libraries
+library(tidyverse)
+library(lubridate)
+library(ISLR)
+library(randomForest)
+library(tree)
+library(glmnet)
+library(boot)
+library(caret)
+
+# ggplot theme:
+theme_set(
+  theme_classic() + 
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_blank())
+)
+```
+
+In this project we will analyze the dataset in the file Churn.csv. 
+Customer churn is a term used for when customers exit relationship with a company sercive. This data set contains information about properties of individuals who are using, or have stopped using,a service by an internet provider. In order to make decisions of potential measures to reduce churning we will predict two quantities:
+  - The size of a subscriber bill 
+  - Probability that the customer churns
+  
+Data and structure
+```{r}
+churn <- read.csv('Churn.csv')
+
+# Structure
+str(churn)
+```
+Change variables with few levels to factors. This makes sense because their numerical 
+value is not meaningful for our analysis. 
+
+We take away variable ID since it does not benefit us in our analysis. We want 
+to predict how likely it is that customers will churn in the future based on 
+other data gathered, it is very unlikely that a specific customers ID can be
+associated with churning.
+
+```{r }
+# Change to factors variables with few levels
+churn <- churn %>% 
+  mutate(
+    is_tv_subscriber = as.factor(is_tv_subscriber),
+    is_movie_package_subscriber = as.factor(is_movie_package_subscriber),
+    churn = as.factor(churn)
+  ) %>% 
+  select(-id)
+
+str(churn) 
+```
+Make a test and training set 50 / 50 for predictions
+```{r}
+# Test and train half half
+set.seed(12454437)
+
+n = nrow(churn)
+ind = sample(1:n, size = floor(n/2))
+
+train = churn[ind, ]
+test = churn[-ind, ]
+```
+
+Now we use descriptive methods to find useful predictors for bill_avg. 
+
+```{r}
+plot(bill_avg ~ ., data = train)
+```
+The value of bill_avg seems to vary with all predictors, possibly with the exception of download_avg and upload_avg, where patterns are difficult to see visually.
+
+We will now try to produce the best possible predictors of bill_avg using OLS and evauate them.
+```{r }
+# Standard linear regression, first with all predictors
+lr <- lm(bill_avg ~., data = train)
+pred_lr <- predict(lr, newdata = test)
+MSE_lr <- mean((test$bill_avg - pred_lr)^2)
+
+# Without download_avg and upload_avg
+lr2 <- lm(bill_avg ~. -download_avg -upload_avg, data = train)
+pred_lr2 <- predict(lr2,newdata = test)
+MSE_lr2 <- mean((test$bill_avg - pred_lr2)^2)
+
+MSE_lr
+MSE_lr2
+```
+MSE is used as a measure since no explicit decision situation was given that could inform what a good prediction would be. Given the conclution from plot analysis above, an experiment was done with removing download_avg and upload_avg. The full model performed much better than the reduced model.
+
+
+We will now try to fit a LASSO regression with all variables. The variables are standardized since they have very different scales. The factor variables are transformed back to dummies. The effect of the LASSO-restriction is not very large and none of the coefficients is reduced to zero. I chose cross validation method to estimate Lambda, which got estimated to ~ 0.18. I decided to keep standardize option TRUE, in order to tweak predictors to comparable scale. I noticed different ranges in predictors as described in the sub-tasks above,  and to compare the magnitude and estimate the coefficients, making them standardized, lead to lower test MSE for predictions. This way also makes it easier to compare the coefficients estimated by the model. Since LASSO is estimating variable importance based on the magnitude of coefficients, if they would be on a different scale, it could  lead to potentially wrong estimation of variable importance. We can see that coefficients are very similar to the full model estimated earlier.
+```{r}
+# Test and train half half
+set.seed(12454437)
+
+n <- nrow(churn)
+ind <- sample(1:n, size = floor(n/2))
+
+train <- churn[ind, ]
+test <- churn[-ind, ]
+xtest <- model.matrix(bill_avg ~ ., test)[, -1]
+
+# Transform with dummy variables
+x <- model.matrix(bill_avg ~ ., train)[, -1]
+y <- train$bill_avg
+
+# With cross validation to tune parameters (lambda)
+cv_out <- cv.glmnet(x, y, alpha = 1)
+plot(cv_out)
+
+# Best lambda
+best_lam <- cv_out$lambda.min
+
+# LASSO mod
+lasso_mod <- glmnet(x, y, alpha = 1, lambda = best_lam) 
+
+# Coefficients
+lasso_coeff <- predict(lasso_mod, type = 'coefficients', s = best_lam)
+lasso_coeff
+```
+
+Now I will compute predictions for bill_avg with the model fitted above and evaluate them with testMSE like with OLS before. Which as we can see below, is for all practical purposes, equal to the one for OLS.
+```{r }
+# Predictions
+lasso_pred <- predict(lasso_mod, s = best_lam, newx = xtest)
+
+# test MSE
+mean((test$bill_avg - lasso_pred)^2)
+```
+
+Now we will try to fit a regression tree to bill_avg. 
+```{r}
+# Tree
+tree1 <- tree(bill_avg ~., data = train)
+
+plot(tree1)
+text(tree1, cex = 0.6)
+```
+The lowest average bill, 4.41, is found for customers with a download average of less than 332.6, that have never exceeded the download limit, have an upload average below 15.55 and have been subscribers for less than 0.075 years (almost new customers).
+
+A mechanical interpretation is that the highest average bill, 291.8, is found for customers with a download average above 332.6, who have download average above 864.3 and who are not a TV subscriber. Simplified, the highest average bills are found for non-TV-subscribers with a download average above 864.3.
+
+
+Now we will use the fitted tree model to predict bill_avg.
+```{r }
+# Normal tree
+pred_tree <- predict(tree1, newdata = test)
+
+MSEtree <- mean((test$bill_avg - pred_tree)^2)
+MSEtree
+```
+
+A little bit higher MSE might mean that the data have more of linear patterns with predictors and predicted variable. One more explanation is that maybe some predictors do not  have a high prediction power, which can lead tree models to overfit the training data by creating too many splits and capturing noise. 
+
+
+We will now try to fit a random forest to bill_avg. We will also make a plot of variable importance measure for the predictors. 
+```{r}
+bag1 <- randomForest(bill_avg ~ ., data = train, mtry = 7, ntree = 50)
+
+varImpPlot(bag1)
+```
+I used 50 trees to reduce computation time. We can see from the VarImpPlot that download_avg has clearly the highest impact on bill_avg, which is not consistent in what we found early on in our exploratory analysis, but it is consistent with the tree model above. We can also see some significant impact from variables like upload_avg and subscription_age. 
+
+We will now try to fit our random forest model to predict bill_avg and evaluate the predictions.
+```{r }
+pred_forest <- predict(bag1, newdata = test)
+
+MSE <- mean((test$bill_avg - pred_forest)^2)
+MSE
+```
+As we can see, the testMSE is significantly lower than other methods we used before.
+
+# Summary 
+
+The linear models would imply that a high bill costumer has no TV or movie package subsription, has had subscription for a long time and a short remaining contract, many service failures and high download and upload averages, has not been over the download limit a lot and has churned. A regression tree can gave a more nuanced pattern because of possible non-linearities. In this case, however, the pattern is the same as for the linear model with the exception that all variables does not make it to the tree with the default settings of the tree-function. A customer with a high download average without a TV subscription has a high bill on average. A similar argument can be made for the low bill customers. A natural conclusion from this is that a linear model is appropriate. However, the random forest, a non-linear model, is shown to produce superior predictions, compared to the linear models. If assumptions about the availability of the variables at the time of prediction is made differently in previous, the answer to this question will look somewhat different.
+
+
+# In this part we will predict the churn variable.
+
+Make sure that all variables are on the right format for your analysis. Use tables and
+graphs and common sense to remove variables that you think will not be helpful.
+Motivate your choices thoroughly. Use descriptive statistics to find promising predictors
+for churn.
+
+We will recode the data to proper variables. We will again use exploratory analysis and common sense to pick out meaningful variables for our analysis. 
+
+  - We still continue without ID variable, for the same reasons as in first part of analysis 
+  
+```{r}
+# Data
+churn <- read.csv('Churn.csv')
+
+# Recode
+churn <- churn %>% 
+  mutate(churn = as.factor(churn)) %>% 
+  select(-id)
+
+res <- churn %>% 
+  group_by(churn) %>%
+  summarise_all(list(mean = mean))
+
+t(res)
+```
+
+```{r}
+# Plot
+plot(remaining_contract ~ churn, data = churn)
+```
+The means of is_movie_package_subscriber, remaining_contract, download_avg, upload_avg
+and download_over_limit are notably different for the churners and non-churners and might be
+helpful in predicting churn. A boxplot of remaining_contract shows, not surprisingly, a strong
+association with churning. Churning with a long contract remaining is usually not a money saving
+decision.
+
+Make our test and train sets
+```{r }
+# Change remaining variables to factors as in start of the analysis
+churn <- churn %>% 
+  mutate(
+    is_tv_subscriber = as.factor(is_tv_subscriber),
+    is_movie_package_subscriber = as.factor(is_movie_package_subscriber))
+
+# Test and train half half
+set.seed(12454437)
+
+n = nrow(churn)
+ind = sample(1:n, size = floor(n/2))
+
+train <- churn[ind, ]
+test <- churn[-ind, ]
+```
+
+We will now try to fit a logistic regression with all variables to churn. We will also interpret the coefficients associated with is_tv_subscriber and is_movie_package_subscriber.
+```{r }
+# Logistic regression
+logistic1 <- glm(churn ~ ., data = train, family = binomial())
+summary(logistic1)
+```
+```{r}
+tv <- round(100*exp(coef(logistic1)["is_tv_subscriber1"]))
+movie <- round(100*exp(coef(logistic1)["is_movie_package_subscriber1"]))
+
+tv
+movie
+```
+All variables except bill_avg and upload_avg are significant on the 10%-level. Everything else equal,
+the odds for churning for a TV-subscriber is 18% of the odds for a non-TV-subscriber. Everything else
+equal, the odds for churning for a movie package subscriber, is 97% of the odds for a non-subscriber.
+
+ 
+Now we will use the logistic regression from above to predict churn. We will use 50% threshold to make our predictions. Here confusion matrices are used but ROC-curves/AUC as a statistical measure to evaluate our predictions. As we can see, we managed to get quite good predictions. 
+```{r}
+# Predictions
+pred_logistic1 <- predict(logistic1,newdata=test,type="response")>0.5
+
+# Table of results
+prop.table(table(test$churn,pred_logistic1),margin=1)
+```
+
+We will now try to use random forest to predict churn and evaluate the predictions. 
+```{r }
+# Random forest mod
+forest_mod <- randomForest(churn ~ . , data = train, ntree = 50)
+
+# Predictions using random forest
+pred_forest <- predict(forest_mod, newdata = test, type = 'response')
+
+# Table of predictions to evaluate 
+prop.table(table(test$churn, pred_forest), margin = 1)
+```
+The random forest improved the predictions considerably. 
+
+# Summary, what are typical features of customers who churn?
+
+According to the logistic regression, a churning customer has no movie package,
+has been a customer for a short time only, has a short remaining contract, has many service failures,
+low download and upload averages and is often over the download limit. 
+
+
